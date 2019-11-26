@@ -22,6 +22,8 @@ import networks
 from layers import disp_to_depth
 from utils import download_model_if_doesnt_exist
 
+from maskrcnn_benchmark.config import cfg
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -29,18 +31,6 @@ def parse_args():
 
     parser.add_argument('--image_path', type=str,
                         help='path to a test image or folder of images', required=True)
-    parser.add_argument('--model_name', type=str,
-                        help='name of a pretrained model to use',
-                        choices=[
-                            "mono_640x192",
-                            "stereo_640x192",
-                            "mono+stereo_640x192",
-                            "mono_no_pt_640x192",
-                            "stereo_no_pt_640x192",
-                            "mono+stereo_no_pt_640x192",
-                            "mono_1024x320",
-                            "stereo_1024x320",
-                            "mono+stereo_1024x320"])
     parser.add_argument('--ext', type=str,
                         help='image extension to search for in folder', default="jpg")
     parser.add_argument("--no_cuda",
@@ -53,41 +43,41 @@ def parse_args():
 def test_simple(args):
     """Function to predict for a single image or folder of images
     """
-    assert args.model_name is not None, \
-        "You must specify the --model_name parameter; see README.md for an example"
 
     if torch.cuda.is_available() and not args.no_cuda:
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
 
-    download_model_if_doesnt_exist(args.model_name)
-    model_path = os.path.join("models", args.model_name)
+    model_path = os.path.join("models")
     print("-> Loading model from ", model_path)
     encoder_path = os.path.join(model_path, "encoder.pth")
     depth_decoder_path = os.path.join(model_path, "depth.pth")
 
     # LOADING PRETRAINED MODEL
     print("   Loading pretrained encoder")
-    encoder = networks.ResnetEncoder(18, False)
-    loaded_dict_enc = torch.load(encoder_path, map_location=device)
+    config_file = "./configs/e2e_mask_rcnn_R_50_FPN_1x.yaml"
+    cfg.merge_from_file(config_file)
+    cfg.freeze()
+    maskrcnn_path = "./e2e_mask_rcnn_R_50_FPN_1x.pth"
+    encoder = networks.ResnetEncoder(cfg, maskrcnn_path)
+    loaded_dict_enc = torch.load(encoder_path)
 
     # extract the height and width of image that this model was trained with
     feed_height = loaded_dict_enc['height']
     feed_width = loaded_dict_enc['width']
     filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in encoder.state_dict()}
     encoder.load_state_dict(filtered_dict_enc)
-    encoder.to(device)
+    encoder.cuda()
     encoder.eval()
 
     print("   Loading pretrained decoder")
-    depth_decoder = networks.DepthDecoder(
-        num_ch_enc=encoder.num_ch_enc, scales=range(4))
+    depth_decoder = networks.DepthDecoder(scales=[0])
 
-    loaded_dict = torch.load(depth_decoder_path, map_location=device)
+    loaded_dict = torch.load(depth_decoder_path)
     depth_decoder.load_state_dict(loaded_dict)
 
-    depth_decoder.to(device)
+    depth_decoder.cuda()
     depth_decoder.eval()
 
     # FINDING INPUT IMAGES
@@ -102,7 +92,24 @@ def test_simple(args):
     else:
         raise Exception("Can not find args.image_path: {}".format(args.image_path))
 
+    print("-> Computing predictions with size {}x{}".format(feed_width, feed_height))
     print("-> Predicting on {:d} test images".format(len(paths)))
+
+    normalize_transform = transforms.Normalize(
+            mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
+        )
+    to_bgr_transform = transforms.Lambda(lambda x: x * 255)
+    transform_simvodis = transforms.Compose(
+            [
+                # transforms.ToPILImage(),
+                transforms.Resize((feed_height * 2, feed_width * 2)),
+                transforms.ToTensor(),
+                to_bgr_transform,
+                normalize_transform,
+            ]
+        )
+    color_aug = transforms.ColorJitter.get_params(
+                (0.8, 1.2), (0.8, 1.2), (0.8, 1.2), (-0.1, 0.1))
 
     # PREDICTING ON EACH IMAGE IN TURN
     with torch.no_grad():
@@ -115,11 +122,13 @@ def test_simple(args):
             # Load image and preprocess
             input_image = pil.open(image_path).convert('RGB')
             original_width, original_height = input_image.size
-            input_image = input_image.resize((feed_width, feed_height), pil.LANCZOS)
-            input_image = transforms.ToTensor()(input_image).unsqueeze(0)
+            #input_image = input_image.resize((feed_width, feed_height), pil.LANCZOS)
+            input_image = transforms.Resize((feed_width, feed_height),interpolation=pil.ANTIALIAS)(input_image)
+            #input_image = transforms.ToTensor()(input_image).unsqueeze(0)
+            input_image = transform_simvodis(color_aug(input_image))
 
             # PREDICTION
-            input_image = input_image.to(device)
+            input_image = input_image.cuda()
             features = encoder(input_image)
             outputs = depth_decoder(features)
 
